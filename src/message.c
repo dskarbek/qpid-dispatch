@@ -31,6 +31,12 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <limits.h>
+#include <sys/time.h>
+#include <time.h>
+#include <proton/message.h>
+
+#define PROPERTIES_STR_SIZE 2500
+#define CURR_PROPERTY_SYMBOL_SIZE 100
 
 static const unsigned char * const MSG_HDR_LONG                 = (unsigned char*) "\x00\x80\x00\x00\x00\x00\x00\x00\x00\x70";
 static const unsigned char * const MSG_HDR_SHORT                = (unsigned char*) "\x00\x53\x70";
@@ -82,18 +88,161 @@ static void quote(char* bytes, int n, char **begin, char *end) {
     }
 }
 
+/* Convert passed time value into printable format */
+static void get_printable_time(pn_timestamp_t my_time, char *buffer, size_t len)
+{
+    struct timeval my_timeval;
+    time_t my_time_t;
+    struct tm *my_tm;
+    char fmt[100];
+
+    my_timeval.tv_sec = my_time/1000;
+    my_timeval.tv_usec = (my_time%1000) * 1000;
+
+    my_time_t = my_timeval.tv_sec;
+    if ((my_tm = localtime(&my_time_t)) != NULL)
+    {
+        strftime(fmt, sizeof fmt, "%Y-%m-%d %H:%M:%S.%%03lu %z", my_tm);
+        snprintf(buffer, len, fmt, my_timeval.tv_usec / 1000);
+    }
+}
+
+/** Get message size */
+static size_t get_message_size(qd_message_content_t *content)
+{
+    size_t len = 0;
+    qd_buffer_t *buf = DEQ_HEAD(content->buffers);
+
+    while (buf) {
+        len += qd_buffer_size(buf);
+        buf = buf->next;
+    }
+
+    return len;
+}
+
+/** Flatten the message contents in the buffer passed. */
+static size_t flatten_bufs(qd_message_content_t *content, char *buffer)
+{
+    char *cursor = buffer;
+    qd_buffer_t *buf = DEQ_HEAD(content->buffers);
+
+    while (buf) {
+        memcpy(cursor, qd_buffer_base(buf), qd_buffer_size(buf));
+        cursor += qd_buffer_size(buf);
+        buf = buf->next;
+    }
+
+    return (size_t) (cursor - buffer);
+}
+
 /** Copy a message field for use in log messages. Output in buffer. */
 static void copy_field(qd_message_t *msg,  int field, int max, char *pre, char *post,
                        char **begin, char *end)
 {
+    char *buffer;
+    char creation_time_str[100];
+    char timestamp_bytes[8];
+    char properties_str[PROPERTIES_STR_SIZE];
+    char curr_property_symbol[CURR_PROPERTY_SYMBOL_SIZE];
+    char curr_property_str[CURR_PROPERTY_SYMBOL_SIZE + 10];
+
     qd_iterator_t* iter = qd_message_field_iterator(msg, field);
     if (iter) {
         aprintf(begin, end, "%s", pre);
         qd_iterator_reset(iter);
-        for (int j = 0; !qd_iterator_end(iter) && j < max; ++j) {
+        pn_timestamp_t creation_time = 0;
+        int i = 8, j;
+        for (j = 0; !qd_iterator_end(iter) && j < max; ++j) {
             char byte = qd_iterator_octet(iter);
+            if (field == QD_FIELD_CREATION_TIME && i > 0) {
+                timestamp_bytes[--i] = byte;
+                continue;
+            }
+	    if (field == QD_FIELD_APPLICATION_PROPERTIES) {
+		continue;
+	    }
             quote(&byte, 1, begin, end);
         }
+
+        if (field == QD_FIELD_CREATION_TIME) {
+            memcpy(&creation_time, timestamp_bytes, 8);
+            if (creation_time > 0) {
+                get_printable_time(creation_time, creation_time_str, 100);
+                aprintf(begin, end, "%s", creation_time_str);
+            }
+        }
+
+        if (field == QD_FIELD_APPLICATION_PROPERTIES) {
+            /* Convert qd_message_t to pn_message_t */
+            qd_message_content_t *content = MSG_CONTENT(msg);
+            pn_message_t *pn_msg = pn_message();
+            pn_data_t *properties;
+            pn_bytes_t c;
+            int x = 0;
+            size_t len = get_message_size(content);
+
+            buffer = (char *) malloc(len);
+            if (buffer == NULL)
+                return;
+            len = flatten_bufs(content, buffer);
+            int result = pn_message_decode(pn_msg, buffer, len);
+            if (result != 0) {
+                pn_message_free(pn_msg);
+                free(buffer);
+                return;
+            }
+            free(buffer);
+
+            properties = pn_message_properties(pn_msg);
+            pn_data_next(properties);
+            assert(pn_data_type(properties) == PN_MAP);
+            size_t mapsize = pn_data_get_map(properties);
+
+            strcpy(curr_property_str, "");
+            strcpy(properties_str, "");
+
+            /* Enter the properties map */
+            pn_data_enter(properties);
+            for (x = 0; x < mapsize/2; x++)
+            {
+                pn_data_next(properties);
+                c = pn_data_get_string(properties);
+                if (c.size < CURR_PROPERTY_SYMBOL_SIZE) {
+                    memcpy(curr_property_symbol, c.start, c.size);
+                    curr_property_symbol[c.size] = '\0';
+                }
+                else {
+                    memcpy(curr_property_symbol, c.start, CURR_PROPERTY_SYMBOL_SIZE - 1);
+                    curr_property_symbol[CURR_PROPERTY_SYMBOL_SIZE - 1] = '\0';
+                }
+                sprintf(curr_property_str, "[Key: %s => ", curr_property_symbol);
+                if (strlen(properties_str) + strlen(curr_property_str) < PROPERTIES_STR_SIZE)
+                    strcat(properties_str, curr_property_str);
+                else
+                    break;
+
+                pn_data_next(properties);
+                c = pn_data_get_string(properties);
+                if (c.size < CURR_PROPERTY_SYMBOL_SIZE) {
+                    memcpy(curr_property_symbol, c.start, c.size);
+                    curr_property_symbol[c.size] = '\0';
+                }
+                else {
+                    memcpy(curr_property_symbol, c.start, CURR_PROPERTY_SYMBOL_SIZE - 1);
+                    curr_property_symbol[CURR_PROPERTY_SYMBOL_SIZE - 1] = '\0';
+                }
+                sprintf(curr_property_str, "Value: %s], ", curr_property_symbol);
+                if (strlen(properties_str) + strlen(curr_property_str) < PROPERTIES_STR_SIZE)
+                    strcat(properties_str, curr_property_str);
+                else
+                    break;
+            }
+
+            pn_data_exit(properties);
+            aprintf(begin, end, "%s", properties_str);
+            pn_message_free(pn_msg);
+	}
         aprintf(begin, end, "%s", post);
         qd_iterator_free(iter);
     }
@@ -107,9 +256,14 @@ char* qd_message_repr(qd_message_t *msg, char* buffer, size_t len) {
         char *begin = buffer;
         char *end = buffer + len - sizeof(REPR_END); /* Save space for ending */
         aprintf(&begin, end, "Message{", msg);
-        copy_field(msg, QD_FIELD_TO, INT_MAX, "to='", "'", &begin, end);
+        copy_field(msg, QD_FIELD_MESSAGE_ID, INT_MAX, " message-id='", "'", &begin, end);
+        //copy_field(msg, QD_FIELD_TO, INT_MAX, "to='", "'", &begin, end);
         copy_field(msg, QD_FIELD_REPLY_TO, INT_MAX, " reply-to='", "'", &begin, end);
-        copy_field(msg, QD_FIELD_BODY, 16, " body='", "'", &begin, end);
+        //copy_field(msg, QD_FIELD_BODY, INT_MAX, " body='", "'", &begin, end);
+        copy_field(msg, QD_FIELD_CORRELATION_ID, INT_MAX, " correlation-id='", "'", &begin, end);
+        copy_field(msg, QD_FIELD_CREATION_TIME, INT_MAX, " creation-time='", "'", &begin, end);
+        copy_field(msg, QD_FIELD_USER_ID, INT_MAX, " user-id='", "'", &begin, end);
+        copy_field(msg, QD_FIELD_APPLICATION_PROPERTIES, INT_MAX, " application properties='", "'", &begin, end);
         aprintf(&begin, end, "%s", REPR_END);   /* We saved space at the beginning. */
     }
     return buffer;
@@ -421,10 +575,14 @@ static qd_field_location_t *qd_message_properties_field(qd_message_t *msg, qd_me
         (intptr_t) &((qd_message_content_t *)0)->field_to,
         (intptr_t) &((qd_message_content_t *)0)->field_subject,
         (intptr_t) &((qd_message_content_t *)0)->field_reply_to,
-        (intptr_t) &((qd_message_content_t *)0)->field_correlation_id
+        (intptr_t) &((qd_message_content_t *)0)->field_correlation_id,
+        (intptr_t) &((qd_message_content_t *)0)->field_content_type,
+        (intptr_t) &((qd_message_content_t *)0)->field_content_encoding,
+        (intptr_t) &((qd_message_content_t *)0)->field_absolute_expiry_time,
+        (intptr_t) &((qd_message_content_t *)0)->field_creation_time
     };
     // update table above if new fields need to be accessed:
-    assert(QD_FIELD_MESSAGE_ID <= field && field <= QD_FIELD_CORRELATION_ID);
+    assert(QD_FIELD_MESSAGE_ID <= field && field <= QD_FIELD_CREATION_TIME);
 
     qd_message_content_t *content = MSG_CONTENT(msg);
     if (!content->section_message_properties.parsed) {
@@ -748,7 +906,10 @@ qd_message_t *qd_message_receive(pn_delivery_t *delivery)
             }
 
             char repr[qd_message_repr_len()];
+            // dskarbek: we could log at a different level here so that we don't need to turn on trace level logging?
             qd_log(log_source, QD_LOG_TRACE, "Received %s on link %s",
+                   // dskarbek: we change the behavior of this method to get the enhanced logging we want, but is it
+                   // proper to log what we are logging.  (i mean generally proper for the open source project)
                    qd_message_repr((qd_message_t*)msg, repr, sizeof(repr)),
                    pn_link_name(link));
 
